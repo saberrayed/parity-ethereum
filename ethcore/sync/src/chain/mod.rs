@@ -98,6 +98,8 @@ use std::cmp;
 use std::time::{Duration, Instant};
 use hash::keccak;
 use heapsize::HeapSizeOf;
+use futures::sync::mpsc as futures_mpsc;
+use api::Notification;
 use ethereum_types::{H256, U256};
 use fastmap::{H256FastMap, H256FastSet};
 use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
@@ -633,6 +635,8 @@ pub struct ChainSync {
 	private_tx_handler: Option<Arc<PrivateTxHandler>>,
 	/// Enable warp sync.
 	warp_sync: WarpSync,
+
+	status_sink: Vec<futures_mpsc::UnboundedSender<SyncState>>
 }
 
 impl ChainSync {
@@ -664,6 +668,7 @@ impl ChainSync {
 			transactions_stats: TransactionsStats::default(),
 			private_tx_handler,
 			warp_sync: config.warp_sync,
+			status_sink: Vec::new()
 		};
 		sync.update_targets(chain);
 		sync
@@ -722,6 +727,18 @@ impl ChainSync {
 		self.peers.clear();
 	}
 
+	pub fn sync_notifications(&mut self) -> Notification<SyncState> {
+		let (sender, receiver) = futures_mpsc::unbounded();
+		self.status_sink.push(sender);
+		receiver
+	}
+
+	fn notify_sync_state(&mut self, state: SyncState) {
+		for sender in &mut self.status_sink {
+			let result = sender.unbounded_send(state);
+		}
+	}
+
 	/// Reset sync. Clear all downloaded data but keep the queue.
 	/// Set sync state to the given state or to the initial state if `None` is provided.
 	fn reset(&mut self, io: &mut SyncIo, state: Option<SyncState>) {
@@ -736,7 +753,9 @@ impl ChainSync {
 				}
 			}
 		}
-		self.state = state.unwrap_or_else(|| Self::get_init_state(self.warp_sync, io.chain()));
+		let state = state.unwrap_or_else(|| Self::get_init_state(self.warp_sync, io.chain()));
+		self.state = state.clone();
+		self.notify_sync_state(state);
 		// Reactivate peers only if some progress has been made
 		// since the last sync round of if starting fresh.
 		self.active_peers = self.peers.keys().cloned().collect();
@@ -824,6 +843,7 @@ impl ChainSync {
 		} else if timeout && !self.warp_sync.is_warp_only() {
 			trace!(target: "sync", "No snapshots found, starting full sync");
 			self.state = SyncState::Idle;
+			self.notify_sync_state(SyncState::Idle);
 			self.continue_sync(io);
 		}
 	}
@@ -836,9 +856,11 @@ impl ChainSync {
 				}
 			}
 			self.state = SyncState::SnapshotManifest;
+			self.notify_sync_state(SyncState::SnapshotManifest);
 			trace!(target: "sync", "New snapshot sync with {:?}", peers);
 		} else {
 			self.state = SyncState::SnapshotData;
+			self.notify_sync_state(SyncState::SnapshotData);
 			trace!(target: "sync", "Resumed snapshot sync with {:?}", peers);
 		}
 	}
@@ -920,6 +942,7 @@ impl ChainSync {
 	fn pause_sync(&mut self) {
 		trace!(target: "sync", "Block queue full, pausing sync");
 		self.state = SyncState::Waiting;
+		self.notify_sync_state(SyncState::Waiting);
 	}
 
 	/// Find something to do for a peer. Called for a new peer or when a peer is done with its task.
@@ -971,6 +994,7 @@ impl ChainSync {
 							SyncRequester::request_blocks(self, io, peer_id, request, BlockSet::NewBlocks);
 							if self.state == SyncState::Idle {
 								self.state = SyncState::Blocks;
+								self.notify_sync_state(SyncState::Blocks);
 							}
 							return;
 						}
@@ -1003,6 +1027,7 @@ impl ChainSync {
 							if self.snapshot.done_chunks() - (state_chunks_done + block_chunks_done) as usize > MAX_SNAPSHOT_CHUNKS_DOWNLOAD_AHEAD {
 								trace!(target: "sync", "Snapshot queue full, pausing sync");
 								self.state = SyncState::SnapshotWaiting;
+								self.notify_sync_state(SyncState::SnapshotWaiting);
 								return;
 							}
 						},
@@ -1187,11 +1212,13 @@ impl ChainSync {
 		match self.state {
 			SyncState::Waiting if !io.chain().queue_info().is_full() => {
 				self.state = SyncState::Blocks;
+				self.notify_sync_state(SyncState::Blocks);
 				self.continue_sync(io);
 			},
 			SyncState::SnapshotData => match io.snapshot_service().status() {
 				RestorationStatus::Inactive | RestorationStatus::Failed => {
 					self.state = SyncState::SnapshotWaiting;
+					self.notify_sync_state(SyncState::SnapshotWaiting);
 				},
 				RestorationStatus::Initializing { .. } | RestorationStatus::Ongoing { .. } => (),
 			},
@@ -1208,12 +1235,14 @@ impl ChainSync {
 						if !self.snapshot.is_complete() && self.snapshot.done_chunks() - (state_chunks_done + block_chunks_done) as usize <= MAX_SNAPSHOT_CHUNKS_DOWNLOAD_AHEAD {
 							trace!(target:"sync", "Resuming snapshot sync");
 							self.state = SyncState::SnapshotData;
+							self.notify_sync_state(SyncState::SnapshotData);
 							self.continue_sync(io);
 						}
 					},
 					RestorationStatus::Failed => {
 						trace!(target: "sync", "Snapshot restoration aborted");
 						self.state = SyncState::WaitingPeers;
+						self.notify_sync_state(SyncState::WaitingPeers);
 						self.snapshot.clear();
 						self.continue_sync(io);
 					},
